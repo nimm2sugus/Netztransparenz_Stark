@@ -14,10 +14,10 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title("🔌 Electricity Grid & Charging Network Analyzer")
+st.title("🔌 Multi-Curve Grid & Charging Network Analyzer")
 st.write(
-    "This dashboard monitors key grid metrics from Netztransparenz.de to assist "
-    "with charging station network planning and smart-charging optimization."
+    "Select multiple grid metrics to compare curves, analyze correlation, "
+    "and optimize charging times."
 )
 
 # Initialize a runtime log to trace API actions
@@ -36,13 +36,18 @@ client_secret = st.sidebar.text_input("Client Secret", value=client_secret_env, 
 
 st.sidebar.header("2. Parameters")
 endpoint_options = {
-    "Spot Market Prices": {"data": "Spotmarktpreise", "product": "none"},
+    "Spot Market Prices (ct/kWh)": {"data": "Spotmarktpreise", "product": "none"},
     "Grid Traffic Light": {"data": "TrafficLight", "product": "none"},
-    "Solar Forecast": {"data": "onlineHochrechnung", "product": "Solar"},
-    "Wind Onshore Forecast": {"data": "onlineHochrechnung", "product": "Windonshore"},
+    "Solar Forecast (MW)": {"data": "onlineHochrechnung", "product": "Solar"},
+    "Wind Onshore Forecast (MW)": {"data": "onlineHochrechnung", "product": "Windonshore"},
 }
-selected_metric = st.sidebar.selectbox("Metric", list(endpoint_options.keys()))
-endpoint_meta = endpoint_options[selected_metric]
+
+# Changed to multiselect so users can select multiple curves at once
+selected_metrics = st.sidebar.multiselect(
+    "Select Metrics to Display", 
+    options=list(endpoint_options.keys()),
+    default=["Spot Market Prices (ct/kWh)"]
+)
 
 # Date selection (Defaults to past dates to ensure historical data exists)
 today = datetime.date.today()
@@ -75,90 +80,60 @@ def fetch_token(cid, secret):
         err = f"Auth connection error: {str(e)}"
         return None, err
 
-# --- Robust Data Fetching & Parsing Function ---
-def fetch_api_data(data_param, product_param, start, end, token):
+# --- Cached Data Fetching Function ---
+# Caching here is essential so that adding/removing curves does not trigger redundant API hits
+@st.cache_data(ttl=600)  # Cache individual queries for 10 minutes
+def fetch_single_metric(data_param, product_param, start, end, token):
     str_start = start.strftime("%Y-%m-%d")
     str_end = end.strftime("%Y-%m-%d")
     headers = {'Authorization': f'Bearer {token}'}
     
-    # Define potential URL variations for endpoints with "n/e" (not applicable) products
     urls_to_try = []
-    
     if product_param == "none":
-        # Pattern 1: Omit the product segment entirely (Common for 'n/e' endpoints)
         urls_to_try.append(f"https://ds.netztransparenz.de/api/v1/data/{data_param}/{str_start}/{str_end}")
-        # Pattern 2: Use a hyphen placeholder
         urls_to_try.append(f"https://ds.netztransparenz.de/api/v1/data/{data_param}/-/{str_start}/{str_end}")
-        # Pattern 3: Use 'none' as a literal string
         urls_to_try.append(f"https://ds.netztransparenz.de/api/v1/data/{data_param}/none/{str_start}/{str_end}")
     else:
-        # Standard pattern with the active product segment
         urls_to_try.append(f"https://ds.netztransparenz.de/api/v1/data/{data_param}/{product_param}/{str_start}/{str_end}")
         
-    last_err = None
     for url in urls_to_try:
-        logs.append(f"Attempting API request: {url}")
         try:
             res = requests.get(url, headers=headers, timeout=15)
             if res.ok:
-                logs.append(f"Successful connection with URL: {url}")
-                
-                # Check for empty body
                 if not res.text or not res.text.strip():
-                    last_err = "API returned an empty response."
-                    logs.append(last_err)
                     continue
                 
-                # --- Scenario A: Parse Semicolon-Separated German CSV ---
+                # Semicolon-Separated German CSV Parsing
                 if ";" in res.text or "Datum" in res.text:
-                    logs.append("CSV format detected. Parsing table structures...")
-                    try:
-                        # Parse CSV using semicolon delimiters and German decimals
-                        df = pd.read_csv(io.StringIO(res.text), sep=";", decimal=",")
-                        
-                        # Normalize German columns to a standard Timestamp
-                        if "Datum" in df.columns and "von" in df.columns:
-                            df["Timestamp"] = pd.to_datetime(
-                                df["Datum"] + " " + df["von"], 
-                                format="%d.%m.%Y %H:%M", 
-                                errors='coerce'
-                            )
-                        return df, None
-                    except Exception as csv_ex:
-                        last_err = f"Failed parsing CSV: {str(csv_ex)}"
-                        logs.append(last_err)
-                        continue
+                    df = pd.read_csv(io.StringIO(res.text), sep=";", decimal=",")
+                    if "Datum" in df.columns and "von" in df.columns:
+                        df["Timestamp"] = pd.to_datetime(
+                            df["Datum"] + " " + df["von"], 
+                            format="%d.%m.%Y %H:%M", 
+                            errors='coerce'
+                        )
+                    return df, None
                 
-                # --- Scenario B: Parse standard JSON JSON ---
-                try:
-                    raw_json = res.json()
-                    df_json = pd.DataFrame()
-                    if isinstance(raw_json, list):
-                        df_json = pd.DataFrame(raw_json)
-                    elif isinstance(raw_json, dict):
-                        for key in ["data", "values", "responseData"]:
-                            if key in raw_json and isinstance(raw_json[key], list):
-                                df_json = pd.DataFrame(raw_json[key])
+                # Standard JSON Parsing
+                raw_json = res.json()
+                df_json = pd.DataFrame()
+                if isinstance(raw_json, list):
+                    df_json = pd.DataFrame(raw_json)
+                elif isinstance(raw_json, dict):
+                    for key in ["data", "values", "responseData"]:
+                        if key in raw_json and isinstance(raw_json[key], list):
+                            df_json = pd.DataFrame(raw_json[key])
                                 break
-                        if df_json.empty:
-                            df_json = pd.DataFrame([raw_json])
-                    return df_json, None
-                except ValueError as json_err:
-                    last_err = f"Response is neither valid CSV nor JSON: {res.text[:150]}"
-                    logs.append(last_err)
-                    continue
-            else:
-                last_err = f"Failed (Code {res.status_code}): {res.reason} | Response: {res.text[:150]}"
-                logs.append(last_err)
+                    if df_json.empty:
+                        df_json = pd.DataFrame([raw_json])
+                return df_json, None
         except Exception as e:
-            last_err = f"Connection error: {str(e)}"
-            logs.append(last_err)
+            pass
             
-    return None, f"All routing configurations failed. Details: {last_err}"
+    return None, f"Could not fetch or parse data for {data_param}"
 
-# --- Mock Data Generation (Python 3.14 Compatible) ---
+# --- Mock Data Generator (Python 3.14 Compatible) ---
 def generate_mock_data(metric, start, end):
-    # Using lowercase 'h' to maintain compatibility with new Pandas versions
     date_range = pd.date_range(start=start, end=end, freq='h')
     np.random.seed(42)
     df = pd.DataFrame({"Timestamp": date_range})
@@ -169,107 +144,125 @@ def generate_mock_data(metric, start, end):
         df["Spotmarktpreis in ct/kWh"] = base + noise
     elif "Traffic" in metric:
         df["Status Value"] = np.random.choice([1, 2, 3], size=len(df), p=[0.85, 0.12, 0.03])
-        df["Status Label"] = df["Status Value"].map({1: "Green (Normal)", 2: "Yellow (Warning)", 3: "Red (Congestion)"})
     elif "Solar" in metric:
         hour_of_day = df["Timestamp"].dt.hour
         df["Generation (MW)"] = 5000 * np.maximum(0, np.sin((hour_of_day - 6) / 12 * np.pi)) * np.random.uniform(0.7, 1.1, len(df))
     elif "Wind" in metric:
         df["Generation (MW)"] = 8000 + 4000 * np.sin(df.index / 100) + np.random.normal(0, 500, len(df))
         df["Generation (MW)"] = df["Generation (MW)"].clip(lower=0)
-    else:
-        df["Value"] = np.random.uniform(10, 100, len(df))
         
     return df
 
-# --- Main Logic execution ---
-df_data = pd.DataFrame()
-error_message = None
+# --- Main Logic: Fetching & Merging Curve Data ---
+df_master = pd.DataFrame()
 
-if use_demo:
-    logs.append("Demo Mode active. Displaying simulated data...")
-    df_data = generate_mock_data(selected_metric, date_from, date_to)
+if not selected_metrics:
+    st.info("👈 Please select at least one metric in the sidebar to visualize.")
 else:
-    if not client_id or not client_secret:
-        error_message = "Please enter both Client ID and Client Secret in the sidebar."
-        logs.append("Execution halted: Missing credentials.")
-    else:
-        logs.append("Retrieving Access Token...")
-        token, auth_err = fetch_token(client_id, client_secret)
-        if auth_err:
-            error_message = f"Authentication Error: {auth_err}"
-            logs.append(error_message)
-        elif token:
-            logs.append("Access Token acquired. Initializing data pull...")
-            parsed_df, fetch_err = fetch_api_data(
-                endpoint_meta["data"], 
-                endpoint_meta["product"], 
-                date_from, 
-                date_to, 
-                token
-            )
-            if fetch_err:
-                error_message = f"Data Pull Error: {fetch_err}"
-            elif parsed_df is not None:
-                df_data = parsed_df
-                logs.append(f"Successfully constructed DataFrame. Columns: {list(df_data.columns)}")
-
-# --- Visual Render Section ---
-if error_message:
-    st.error(error_message)
-
-if not df_data.empty:
-    st.subheader(f"Analysis Window: {selected_metric}")
+    # Set up master list to hold temporal series
+    series_to_merge = []
     
-    # Identify value and timeline columns dynamically
-    cols = list(df_data.columns)
-    x_col = "Timestamp" if "Timestamp" in cols else (cols[0] if len(cols) > 0 else None)
-    
-    # Pick the first column that isn't the timestamp to represent the value
-    remaining_cols = [c for c in cols if c not in ["Timestamp", "Status Label", "Datum", "von", "Zeitzone von", "bis", "Zeitzone bis"]]
-    y_col = remaining_cols[0] if remaining_cols else None
-    
-    # Display statistics cards
-    col1, col2, col3 = st.columns(3)
-    if "Status Label" in cols:
-        reds = len(df_data[df_data["Status Value"] == 3])
-        yellows = len(df_data[df_data["Status Value"] == 2])
-        col1.metric("Red (Congested) Hours", f"{reds} hrs")
-        col2.metric("Yellow (Warning) Hours", f"{yellows} hrs")
-        col3.metric("Normal Grid State Share", f"{(len(df_data) - reds - yellows)/len(df_data):.1%}")
-    elif y_col:
-        try:
-            numeric_vals = pd.to_numeric(df_data[y_col], errors='coerce')
-            col1.metric("Maximum Value", f"{numeric_vals.max():.2f}")
-            col2.metric("Minimum Value", f"{numeric_vals.min():.2f}")
-            col3.metric("Average Value", f"{numeric_vals.mean():.2f}")
-        except Exception:
-            pass
-
-    # Plot chart
-    if "Status Label" in cols:
-        fig = px.scatter(
-            df_data, 
-            x=x_col, 
-            y="Status Label", 
-            color="Status Label",
-            color_discrete_map={"Green (Normal)": "green", "Yellow (Warning)": "orange", "Red (Congestion)": "red"},
-            title="Grid State Over Time"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    elif x_col and y_col:
-        try:
-            fig = px.line(df_data, x=x_col, y=y_col, title=f"Trend line: {selected_metric}")
-            if "Prices" in selected_metric:
-                fig.add_hline(y=0, line_dash="dash", line_color="red", annotation_text="Negative Price Level")
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception as plot_err:
-            st.warning(f"Could not automatically map chart parameters: {str(plot_err)}")
+    if use_demo:
+        logs.append("Demo Mode active. Compiling mock data...")
+        for metric in selected_metrics:
+            df_m = generate_mock_data(metric, date_from, date_to)
             
-    st.write("Data Table")
-    st.dataframe(df_data)
+            # Identify value column
+            val_col = [c for c in df_m.columns if c != "Timestamp"][0]
+            # Standardize column name to the metric name for clarity
+            df_m = df_m.rename(columns={val_col: metric})
+            series_to_merge.append(df_m[["Timestamp", metric]])
+    else:
+        if not client_id or not client_secret:
+            st.warning("Please enter your Client ID and Client Secret in the sidebar.")
+        else:
+            token, auth_err = fetch_token(client_id, client_secret)
+            if auth_err:
+                st.error(f"Authentication Error: {auth_err}")
+            elif token:
+                for metric in selected_metrics:
+                    meta = endpoint_options[metric]
+                    logs.append(f"Requesting '{metric}'...")
+                    parsed_df, fetch_err = fetch_single_metric(
+                        meta["data"], 
+                        meta["product"], 
+                        date_from, 
+                        date_to, 
+                        token
+                    )
+                    
+                    if fetch_err:
+                        st.error(f"Failed to load '{metric}': {fetch_err}")
+                    elif parsed_df is not None and not parsed_df.empty:
+                        # Find primary value column (exclude dates/times)
+                        val_cols = [c for c in parsed_df.columns if c not in ["Timestamp", "Datum", "von", "Zeitzone von", "bis", "Zeitzone bis", "Status Label"]]
+                        if val_cols:
+                            primary_col = val_cols[0]
+                            # Clean and convert values to float
+                            parsed_df[primary_col] = pd.to_numeric(parsed_df[primary_col], errors='coerce')
+                            # Rename target column to metric name
+                            parsed_df = parsed_df.rename(columns={primary_col: metric})
+                            series_to_merge.append(parsed_df[["Timestamp", metric]])
+                            logs.append(f"Successfully processed series '{metric}'")
+                        else:
+                            logs.append(f"No numeric columns identified for series '{metric}'")
+
+    # Outer join all retrieved series on their Timestamp
+    if series_to_merge:
+        df_master = series_to_merge[0]
+        for df_next in series_to_merge[1:]:
+            df_master = pd.merge(df_master, df_next, on="Timestamp", how="outer")
+        
+        # Sort values by time to ensure line charts connect chronologically
+        df_master = df_master.sort_values("Timestamp").reset_index(drop=True)
+
+# --- Visualization Render Section ---
+if not df_master.empty:
+    st.subheader("Interactive Grid Trends")
+    
+    # Optional Sub-Time Range Filter Slider
+    min_time = df_master["Timestamp"].min().to_pydatetime()
+    max_time = df_master["Timestamp"].max().to_pydatetime()
+    
+    time_range = st.slider(
+        "Refine Timeline Window",
+        min_value=min_time,
+        max_value=max_time,
+        value=(min_time, max_time),
+        format="DD.MM.YYYY HH:mm"
+    )
+    
+    # Filter master dataset based on the slider range
+    df_filtered = df_master[
+        (df_master["Timestamp"] >= time_range[0]) & 
+        (df_master["Timestamp"] <= time_range[1])
+    ]
+    
+    # Generate interactive multi-line plot using Plotly
+    metric_cols = [c for c in df_filtered.columns if c != "Timestamp"]
+    
+    fig = px.line(
+        df_filtered, 
+        x="Timestamp", 
+        y=metric_cols,
+        title="Comparative Grid Data (Double-click legend items to isolate curves)"
+    )
+    
+    # Customize layout to make reading overlapping curves easier
+    fig.update_layout(
+        hovermode="x unified", 
+        yaxis_title="Metric Values (Units vary by metric)",
+        legend_title_text="Visible Curves"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Display joint datatable
+    with st.expander("Show Unified Dataset Table"):
+        st.dataframe(df_filtered)
+        
 else:
-    if not error_message:
-        st.info("No active dataset to show. Verify parameters or see diagnostic logs below.")
+    if not use_demo and client_id and client_secret:
+        st.info("No matching series could be merged. Please verify the diagnostics below.")
 
 # --- Diagnostic System Logs ---
 st.write("---")
