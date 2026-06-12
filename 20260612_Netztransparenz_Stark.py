@@ -42,7 +42,7 @@ endpoint_options = {
     "Wind Onshore Forecast (MW)": {"data": "onlineHochrechnung", "product": "Windonshore"},
 }
 
-# Changed to multiselect so users can select multiple curves at once
+# Multiselect so users can select multiple curves at once
 selected_metrics = st.sidebar.multiselect(
     "Select Metrics to Display", 
     options=list(endpoint_options.keys()),
@@ -81,7 +81,6 @@ def fetch_token(cid, secret):
         return None, err
 
 # --- Cached Data Fetching Function ---
-# Caching here is essential so that adding/removing curves does not trigger redundant API hits
 @st.cache_data(ttl=600)  # Cache individual queries for 10 minutes
 def fetch_single_metric(data_param, product_param, start, end, token):
     str_start = start.strftime("%Y-%m-%d")
@@ -123,7 +122,7 @@ def fetch_single_metric(data_param, product_param, start, end, token):
                     for key in ["data", "values", "responseData"]:
                         if key in raw_json and isinstance(raw_json[key], list):
                             df_json = pd.DataFrame(raw_json[key])
-                                break
+                            break
                     if df_json.empty:
                         df_json = pd.DataFrame([raw_json])
                 return df_json, None
@@ -166,10 +165,7 @@ else:
         logs.append("Demo Mode active. Compiling mock data...")
         for metric in selected_metrics:
             df_m = generate_mock_data(metric, date_from, date_to)
-            
-            # Identify value column
             val_col = [c for c in df_m.columns if c != "Timestamp"][0]
-            # Standardize column name to the metric name for clarity
             df_m = df_m.rename(columns={val_col: metric})
             series_to_merge.append(df_m[["Timestamp", metric]])
     else:
@@ -194,13 +190,10 @@ else:
                     if fetch_err:
                         st.error(f"Failed to load '{metric}': {fetch_err}")
                     elif parsed_df is not None and not parsed_df.empty:
-                        # Find primary value column (exclude dates/times)
                         val_cols = [c for c in parsed_df.columns if c not in ["Timestamp", "Datum", "von", "Zeitzone von", "bis", "Zeitzone bis", "Status Label"]]
                         if val_cols:
                             primary_col = val_cols[0]
-                            # Clean and convert values to float
                             parsed_df[primary_col] = pd.to_numeric(parsed_df[primary_col], errors='coerce')
-                            # Rename target column to metric name
                             parsed_df = parsed_df.rename(columns={primary_col: metric})
                             series_to_merge.append(parsed_df[["Timestamp", metric]])
                             logs.append(f"Successfully processed series '{metric}'")
@@ -213,7 +206,6 @@ else:
         for df_next in series_to_merge[1:]:
             df_master = pd.merge(df_master, df_next, on="Timestamp", how="outer")
         
-        # Sort values by time to ensure line charts connect chronologically
         df_master = df_master.sort_values("Timestamp").reset_index(drop=True)
 
 # --- Visualization Render Section ---
@@ -248,7 +240,6 @@ if not df_master.empty:
         title="Comparative Grid Data (Double-click legend items to isolate curves)"
     )
     
-    # Customize layout to make reading overlapping curves easier
     fig.update_layout(
         hovermode="x unified", 
         yaxis_title="Metric Values (Units vary by metric)",
