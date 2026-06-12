@@ -212,22 +212,26 @@ else:
 if not df_master.empty:
     st.subheader("Interactive Grid Trends")
     
-    # Optional Sub-Time Range Filter Slider
-    min_time = df_master["Timestamp"].min().to_pydatetime()
-    max_time = df_master["Timestamp"].max().to_pydatetime()
+    # Static Date Selectors instead of the dynamic Javascript Slider
+    st.write("🔍 **Zoom Window**")
+    col_start, col_end = st.columns(2)
     
-    time_range = st.slider(
-        "Refine Timeline Window",
-        min_value=min_time,
-        max_value=max_time,
-        value=(min_time, max_time),
-        format="DD.MM.YYYY HH:mm"
-    )
+    min_date = df_master["Timestamp"].min().date()
+    max_date = df_master["Timestamp"].max().date()
     
-    # Filter master dataset based on the slider range
+    with col_start:
+        zoom_start = st.date_input("Zoom Start Date", value=min_date, min_value=min_date, max_value=max_date)
+    with col_end:
+        zoom_end = st.date_input("Zoom End Date", value=max_date, min_value=min_date, max_value=max_date)
+    
+    # Convert date inputs back to datetime objects for accurate filtering
+    zoom_start_dt = datetime.datetime.combine(zoom_start, datetime.time.min)
+    zoom_end_dt = datetime.datetime.combine(zoom_end, datetime.time.max)
+    
+    # Filter dataset based on inputs
     df_filtered = df_master[
-        (df_master["Timestamp"] >= time_range[0]) & 
-        (df_master["Timestamp"] <= time_range[1])
+        (df_master["Timestamp"] >= zoom_start_dt) & 
+        (df_master["Timestamp"] <= zoom_end_dt)
     ]
     
     # Generate interactive multi-line plot using Plotly
