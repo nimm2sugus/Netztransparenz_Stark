@@ -1,4 +1,5 @@
 import os
+import io
 import requests
 import datetime
 import pandas as pd
@@ -48,9 +49,8 @@ today = datetime.date.today()
 date_from = st.sidebar.date_input("Start Date", today - datetime.timedelta(days=7))
 date_to = st.sidebar.date_input("End Date", today - datetime.timedelta(days=3))
 
-# Warn the user if they select future dates
 if date_to > today:
-    st.sidebar.warning("⚠️ Selected dates are in the future. Real-time historical grid data does not exist yet for this period.")
+    st.sidebar.warning("⚠️ Selected dates include future dates. Real-time historical grid data may not exist yet.")
 
 if date_from > date_to:
     st.error("Error: Start Date must be before or equal to End Date.")
@@ -75,7 +75,7 @@ def fetch_token(cid, secret):
         err = f"Auth connection error: {str(e)}"
         return None, err
 
-# --- Robust Data Fetching Function with Fallback Routing & Parsing ---
+# --- Robust Data Fetching & Parsing Function ---
 def fetch_api_data(data_param, product_param, start, end, token):
     str_start = start.strftime("%Y-%m-%d")
     str_end = end.strftime("%Y-%m-%d")
@@ -103,22 +103,52 @@ def fetch_api_data(data_param, product_param, start, end, token):
             if res.ok:
                 logs.append(f"Successful connection with URL: {url}")
                 
-                # Check if response is empty
+                # Check for empty body
                 if not res.text or not res.text.strip():
-                    last_err = "API returned an empty response. (No data recorded for this date range)."
+                    last_err = "API returned an empty response."
                     logs.append(last_err)
                     continue
                 
-                # Safely attempt to parse JSON
+                # --- Scenario A: Parse Semicolon-Separated German CSV ---
+                if ";" in res.text or "Datum" in res.text:
+                    logs.append("CSV format detected. Parsing table structures...")
+                    try:
+                        # Parse CSV using semicolon delimiters and German decimals
+                        df = pd.read_csv(io.StringIO(res.text), sep=";", decimal=",")
+                        
+                        # Normalize German columns to a standard Timestamp
+                        if "Datum" in df.columns and "von" in df.columns:
+                            df["Timestamp"] = pd.to_datetime(
+                                df["Datum"] + " " + df["von"], 
+                                format="%d.%m.%Y %H:%M", 
+                                errors='coerce'
+                            )
+                        return df, None
+                    except Exception as csv_ex:
+                        last_err = f"Failed parsing CSV: {str(csv_ex)}"
+                        logs.append(last_err)
+                        continue
+                
+                # --- Scenario B: Parse standard JSON JSON ---
                 try:
                     raw_json = res.json()
-                    return raw_json, None
+                    df_json = pd.DataFrame()
+                    if isinstance(raw_json, list):
+                        df_json = pd.DataFrame(raw_json)
+                    elif isinstance(raw_json, dict):
+                        for key in ["data", "values", "responseData"]:
+                            if key in raw_json and isinstance(raw_json[key], list):
+                                df_json = pd.DataFrame(raw_json[key])
+                                break
+                        if df_json.empty:
+                            df_json = pd.DataFrame([raw_json])
+                    return df_json, None
                 except ValueError as json_err:
-                    last_err = f"Response is not valid JSON. Content preview: {res.text[:200]}"
+                    last_err = f"Response is neither valid CSV nor JSON: {res.text[:150]}"
                     logs.append(last_err)
                     continue
             else:
-                last_err = f"Failed (Code {res.status_code}): {res.reason} | Response: {res.text}"
+                last_err = f"Failed (Code {res.status_code}): {res.reason} | Response: {res.text[:150]}"
                 logs.append(last_err)
         except Exception as e:
             last_err = f"Connection error: {str(e)}"
@@ -126,16 +156,17 @@ def fetch_api_data(data_param, product_param, start, end, token):
             
     return None, f"All routing configurations failed. Details: {last_err}"
 
-# --- Mock Data Generation ---
+# --- Mock Data Generation (Python 3.14 Compatible) ---
 def generate_mock_data(metric, start, end):
-    date_range = pd.date_range(start=start, end=end, freq='H')
+    # Using lowercase 'h' to maintain compatibility with new Pandas versions
+    date_range = pd.date_range(start=start, end=end, freq='h')
     np.random.seed(42)
     df = pd.DataFrame({"Timestamp": date_range})
     
     if "Prices" in metric:
-        base = 80 + 30 * np.sin(df.index / 24 * 2 * np.pi)
-        noise = np.random.normal(0, 15, len(df))
-        df["Value (EUR/MWh)"] = base + noise
+        base = 8.0 + 3.0 * np.sin(df.index / 24 * 2 * np.pi)
+        noise = np.random.normal(0, 1.5, len(df))
+        df["Spotmarktpreis in ct/kWh"] = base + noise
     elif "Traffic" in metric:
         df["Status Value"] = np.random.choice([1, 2, 3], size=len(df), p=[0.85, 0.12, 0.03])
         df["Status Label"] = df["Status Value"].map({1: "Green (Normal)", 2: "Yellow (Warning)", 3: "Red (Congestion)"})
@@ -169,7 +200,7 @@ else:
             logs.append(error_message)
         elif token:
             logs.append("Access Token acquired. Initializing data pull...")
-            raw_data, fetch_err = fetch_api_data(
+            parsed_df, fetch_err = fetch_api_data(
                 endpoint_meta["data"], 
                 endpoint_meta["product"], 
                 date_from, 
@@ -178,24 +209,9 @@ else:
             )
             if fetch_err:
                 error_message = f"Data Pull Error: {fetch_err}"
-            elif raw_data:
-                try:
-                    # Parse the structure dynamically
-                    if isinstance(raw_data, list):
-                        df_data = pd.DataFrame(raw_data)
-                    elif isinstance(raw_data, dict):
-                        # Search for typical payload list keys
-                        for key in ["data", "values", "responseData"]:
-                            if key in raw_data and isinstance(raw_data[key], list):
-                                df_data = pd.DataFrame(raw_data[key])
-                                break
-                        if df_data.empty:
-                            df_data = pd.DataFrame([raw_data])
-                    
-                    logs.append(f"Successfully constructed DataFrame. Columns found: {list(df_data.columns)}")
-                except Exception as parse_ex:
-                    error_message = f"JSON parsing failed: {str(parse_ex)}"
-                    logs.append(error_message)
+            elif parsed_df is not None:
+                df_data = parsed_df
+                logs.append(f"Successfully constructed DataFrame. Columns: {list(df_data.columns)}")
 
 # --- Visual Render Section ---
 if error_message:
@@ -209,7 +225,7 @@ if not df_data.empty:
     x_col = "Timestamp" if "Timestamp" in cols else (cols[0] if len(cols) > 0 else None)
     
     # Pick the first column that isn't the timestamp to represent the value
-    remaining_cols = [c for c in cols if c != x_col and c != "Status Label"]
+    remaining_cols = [c for c in cols if c not in ["Timestamp", "Status Label", "Datum", "von", "Zeitzone von", "bis", "Zeitzone bis"]]
     y_col = remaining_cols[0] if remaining_cols else None
     
     # Display statistics cards
