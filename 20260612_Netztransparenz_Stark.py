@@ -48,8 +48,9 @@ today = datetime.date.today()
 date_from = st.sidebar.date_input("Start Date", today - datetime.timedelta(days=7))
 date_to = st.sidebar.date_input("End Date", today - datetime.timedelta(days=3))
 
+# Warn the user if they select future dates
 if date_to > today:
-    st.sidebar.warning("⚠️ Selected dates include future dates. Real-time historical grid data might not exist yet.")
+    st.sidebar.warning("⚠️ Selected dates are in the future. Real-time historical grid data does not exist yet for this period.")
 
 if date_from > date_to:
     st.error("Error: Start Date must be before or equal to End Date.")
@@ -74,7 +75,7 @@ def fetch_token(cid, secret):
         err = f"Auth connection error: {str(e)}"
         return None, err
 
-# --- Robust Data Fetching Function with Fallback Routing ---
+# --- Robust Data Fetching Function with Fallback Routing & Parsing ---
 def fetch_api_data(data_param, product_param, start, end, token):
     str_start = start.strftime("%Y-%m-%d")
     str_end = end.strftime("%Y-%m-%d")
@@ -101,14 +102,27 @@ def fetch_api_data(data_param, product_param, start, end, token):
             res = requests.get(url, headers=headers, timeout=15)
             if res.ok:
                 logs.append(f"Successful connection with URL: {url}")
-                raw_json = res.json()
-                return raw_json, None
+                
+                # Check if response is empty
+                if not res.text or not res.text.strip():
+                    last_err = "API returned an empty response. (No data recorded for this date range)."
+                    logs.append(last_err)
+                    continue
+                
+                # Safely attempt to parse JSON
+                try:
+                    raw_json = res.json()
+                    return raw_json, None
+                except ValueError as json_err:
+                    last_err = f"Response is not valid JSON. Content preview: {res.text[:200]}"
+                    logs.append(last_err)
+                    continue
             else:
                 last_err = f"Failed (Code {res.status_code}): {res.reason} | Response: {res.text}"
-                logs.append(f"Attempt failed: {last_err}")
+                logs.append(last_err)
         except Exception as e:
             last_err = f"Connection error: {str(e)}"
-            logs.append(f"Attempt failed with exception: {last_err}")
+            logs.append(last_err)
             
     return None, f"All routing configurations failed. Details: {last_err}"
 
